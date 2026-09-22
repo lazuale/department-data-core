@@ -2,7 +2,7 @@
 
 Архитектура единого ядра структурированных данных на PostgreSQL для среды, где рабочая информация поступает из Excel, CSV, учетных систем, API и других источников.
 
-[Документация](docs/README.md) · [Архитектура](docs/data-core-architecture-standard.md) · [Модель данных](docs/data-modeling-standard.md) · [Подключение источников](docs/registry-integration-standard.md)
+[Документация](docs/README.md) · [Архитектура](docs/data-core-architecture-standard.md) · [Модель данных](docs/data-modeling-standard.md) · [Именование](docs/naming-convention.md) · [Подключение источников](docs/registry-integration-standard.md)
 
 ```mermaid
 flowchart LR
@@ -28,6 +28,7 @@ flowchart LR
 - Рабочие клиенты используют `api`, аналитические — `mart`.
 - Общая бизнес-логика не размножается по клиентским файлам.
 - Структура базы и серверный SQL-код изменяются через версионированные миграции.
+- Имена SQL-объектов и технических идентификаторов определяются единым стандартом именования.
 
 ## Документация
 
@@ -38,6 +39,7 @@ flowchart LR
 - [Видение и границы](docs/vision-and-scope.md)
 - [Архитектура ядра](docs/data-core-architecture-standard.md)
 - [Моделирование данных](docs/data-modeling-standard.md)
+- [Именование](docs/naming-convention.md)
 - [Подключение новых наборов данных](docs/registry-integration-standard.md)
 - [Клиентский API](docs/client-api-standard.md)
 - [Аналитическая модель](docs/analytics-standard.md)

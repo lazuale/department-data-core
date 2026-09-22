@@ -14,8 +14,11 @@ CREATE SCHEMA mart AUTHORIZATION ddc_owner;
 
 CREATE TABLE meta.schema_migration
 (
-    migration_id text PRIMARY KEY,
-    applied_at   timestamptz NOT NULL DEFAULT clock_timestamp()
+    migration_id text        NOT NULL,
+    applied_at   timestamptz NOT NULL DEFAULT clock_timestamp(),
+
+    CONSTRAINT pk_schema_migration
+        PRIMARY KEY (migration_id)
 );
 
 INSERT INTO meta.schema_migration (migration_id)
