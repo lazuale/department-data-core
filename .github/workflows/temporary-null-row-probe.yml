@@ -1,0 +1,53 @@
+name: PostgreSQL 18 composite NULL probe
+on:
+  pull_request:
+    types: [synchronize]
+permissions:
+  contents: read
+jobs:
+  probe:
+    if: github.head_ref == 'audit/canon-evidence-postgresql-20261012'
+    runs-on: ubuntu-latest
+    container:
+      image: postgres:18
+    services:
+      pg:
+        image: postgres:18
+        env:
+          POSTGRES_DB: isolated_null_probe
+          POSTGRES_PASSWORD: temporary
+        options: >-
+          --health-cmd "pg_isready -U postgres -d isolated_null_probe"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGHOST: pg
+      PGDATABASE: isolated_null_probe
+      PGUSER: postgres
+      PGPASSWORD: temporary
+    steps:
+      - name: Verify COUNT DISTINCT on composite NULL values
+        shell: bash
+        run: |
+          set -euo pipefail
+          psql -X -v ON_ERROR_STOP=1 -qAt <<'SQL'
+          SELECT 'SERVER_VERSION=' || current_setting('server_version_num');
+          WITH v(a, b) AS (
+            VALUES (1::integer, NULL::integer),
+                   (1::integer, NULL::integer),
+                   (1::integer, 2::integer)
+          )
+          SELECT 'COMPOSITE_WITH_NULL=' || count(DISTINCT (a, b)) ||
+                 '|SCALAR_A=' || count(DISTINCT a) ||
+                 '|SCALAR_B=' || count(DISTINCT b)
+          FROM v;
+          WITH v(a, b) AS (
+            VALUES (NULL::text, NULL::integer),
+                   (NULL::text, NULL::integer)
+          )
+          SELECT 'ALL_NULL_COMPOSITE=' || count(DISTINCT (a, b)) ||
+                 '|SCALAR_A=' || count(DISTINCT a) ||
+                 '|SCALAR_B=' || count(DISTINCT b)
+          FROM v;
+          SQL
