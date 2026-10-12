@@ -1,0 +1,102 @@
+name: DDC review counterexamples PG18
+on:
+  pull_request:
+    types: [synchronize]
+permissions:
+  contents: read
+jobs:
+  independent-probes:
+    if: github.head_ref == 'audit/canon-evidence-postgresql-20261012'
+    runs-on: ubuntu-latest
+    container:
+      image: postgres:18
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: review_probe_only
+          POSTGRES_DB: ddc_review_isolated
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ddc_review_isolated"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGDATABASE: ddc_review_isolated
+      PGPASSWORD: review_probe_only
+    steps:
+      - name: Falsify one-size-fits-all participation table rule and diagnose duplicate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          psql -X -v ON_ERROR_STOP=1 -qAt <<'SQL'
+          SELECT 'PG_VERSION=' || current_setting('server_version_num');
+          CREATE TABLE public.review_department (department_code text PRIMARY KEY);
+          CREATE TABLE public.review_device (
+            device_code text PRIMARY KEY,
+            current_department_code text NOT NULL REFERENCES public.review_department,
+            assigned_on date NOT NULL
+          );
+          INSERT INTO public.review_department VALUES ('D1'), ('D2');
+          INSERT INTO public.review_device VALUES ('V1', 'D1', DATE '2026-01-01');
+          UPDATE public.review_device
+            SET current_department_code = 'D2',
+                assigned_on = DATE '2026-02-01'
+            WHERE device_code = 'V1';
+          SELECT 'SIMPLE_FK_RELATION=' || device_code || '|' ||
+                 current_department_code || '|' || assigned_on
+          FROM public.review_device;
+
+          WITH input(org_code, request_no, work_no) AS (
+            VALUES ('СЕВ', 101, 1), ('СЕВ', 101, 1)
+          ),
+          reduced AS (
+            SELECT 'without_org' AS removed, request_no::text || '/' || work_no::text AS reduced_key FROM input
+            UNION ALL
+            SELECT 'without_request', org_code || '/' || work_no::text FROM input
+            UNION ALL
+            SELECT 'without_work', org_code || '/' || request_no::text FROM input
+          )
+          SELECT 'FALSE_POSITIVE=' || removed || '|' || reduced_key || '|' || count(*)
+          FROM reduced
+          GROUP BY removed, reduced_key
+          HAVING count(*) > 1
+          ORDER BY removed;
+
+          WITH input(org_code, request_no, work_no) AS (
+            VALUES ('СЕВ', 101, 1), ('СЕВ', 101, 1)
+          )
+          SELECT 'INPUT_ROWS=' || count(*),
+                 'DISTINCT_FULL_KEY_TUPLES=' || count(DISTINCT (org_code,request_no,work_no))
+          FROM input;
+
+          WITH original(request_no, work_kind, performer) AS (
+            VALUES (101, 'Осмотр', 'Иван'), (101, 'Ремонт', 'Пётр')
+          ), works AS (
+            SELECT DISTINCT request_no, work_kind FROM original
+          ), performers AS (
+            SELECT DISTINCT request_no, performer FROM original
+          ), reconstructed AS (
+            SELECT w.request_no, w.work_kind, p.performer
+            FROM works w JOIN performers p USING (request_no)
+          )
+          SELECT 'SPURIOUS_JOIN=' || work_kind || '|' || performer
+          FROM (
+            SELECT * FROM reconstructed
+            EXCEPT SELECT * FROM original
+          ) q ORDER BY work_kind;
+
+          DO $$
+          BEGIN
+            IF (SELECT count(*) FROM public.review_device WHERE device_code='V1'
+                AND current_department_code='D2' AND assigned_on=DATE '2026-02-01') <> 1
+            THEN RAISE EXCEPTION 'unexpected FK sample'; END IF;
+
+            IF (WITH input(org_code, request_no, work_no) AS
+              (VALUES ('СЕВ',101,1),('СЕВ',101,1))
+              SELECT count(DISTINCT (org_code,request_no,work_no)) FROM input) <> 1
+            THEN RAISE EXCEPTION 'expected one distinct candidate full key'; END IF;
+          END $$;
+          SQL
