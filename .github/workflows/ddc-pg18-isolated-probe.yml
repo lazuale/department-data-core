@@ -1,0 +1,103 @@
+name: PostgreSQL 18 isolated concurrency probe
+on:
+  pull_request:
+    types: [synchronize]
+permissions:
+  contents: read
+jobs:
+  pg18-probe:
+    if: github.head_ref == 'audit/canon-evidence-postgresql-20261012'
+    runs-on: ubuntu-latest
+    container:
+      image: postgres:18
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: probe_only
+          POSTGRES_DB: isolated_probe
+        options: >-
+          --health-cmd "pg_isready -U postgres -d isolated_probe"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGDATABASE: isolated_probe
+      PGPASSWORD: probe_only
+    steps:
+      - name: Reproduce T1 T2 committed invalid state
+        shell: bash
+        run: |
+          set -euo pipefail
+          V=$(psql -X -v ON_ERROR_STOP=1 -qAt -c 'SHOW server_version_num')
+          echo "PG_SERVER_VERSION_NUM=$V"
+          test "$(( V / 10000 ))" -eq 18 || { echo 'FAIL: not PostgreSQL 18'; exit 1; }
+
+          psql -X -v ON_ERROR_STOP=1 -qAt <<'SQL'
+          CREATE TABLE public.probe_request (request_no integer PRIMARY KEY);
+          CREATE TABLE public.probe_assignment (
+            request_no integer NOT NULL REFERENCES public.probe_request (request_no),
+            person text NOT NULL,
+            PRIMARY KEY (request_no, person)
+          );
+          INSERT INTO public.probe_request VALUES (101);
+          INSERT INTO public.probe_assignment VALUES (101, 'Иван');
+          SQL
+
+          mkfifo /tmp/t1in /tmp/t2in
+          psql -X -v ON_ERROR_STOP=1 -qAt < /tmp/t1in > /tmp/t1.log 2>&1 &
+          p1=$!
+          exec 3>/tmp/t1in
+          psql -X -v ON_ERROR_STOP=1 -qAt < /tmp/t2in > /tmp/t2.log 2>&1 &
+          p2=$!
+          exec 4>/tmp/t2in
+
+          print_logs() {
+            echo '=== T1 RAW OUTPUT ==='
+            cat /tmp/t1.log || true
+            echo '=== T2 RAW OUTPUT ==='
+            cat /tmp/t2.log || true
+          }
+          trap print_logs EXIT
+          await_marker() {
+            local marker="$1" logfile="$2" i
+            for ((i=0; i<300; i++)); do
+              if grep -Fxq "$marker" "$logfile"; then return 0; fi
+              sleep 0.1
+            done
+            echo "TIMEOUT waiting for $marker in $logfile"
+            return 1
+          }
+
+          printf "BEGIN ISOLATION LEVEL READ COMMITTED; SELECT 'T1_BEGIN';\n" >&3
+          await_marker T1_BEGIN /tmp/t1.log
+          printf "SELECT 'T1_COUNT=' || count(*) FROM public.probe_assignment WHERE request_no=101;\n" >&3
+          await_marker T1_COUNT=1 /tmp/t1.log
+
+          printf "BEGIN ISOLATION LEVEL READ COMMITTED; SELECT 'T2_BEGIN';\n" >&4
+          await_marker T2_BEGIN /tmp/t2.log
+          printf "SELECT 'T2_COUNT=' || count(*) FROM public.probe_assignment WHERE request_no=101;\n" >&4
+          await_marker T2_COUNT=1 /tmp/t2.log
+
+          printf "INSERT INTO public.probe_assignment VALUES (101, 'Анна'); SELECT 'T1_INSERT_OK';\n" >&3
+          await_marker T1_INSERT_OK /tmp/t1.log
+          printf "INSERT INTO public.probe_assignment VALUES (101, 'Борис'); SELECT 'T2_INSERT_OK';\n" >&4
+          await_marker T2_INSERT_OK /tmp/t2.log
+
+          printf "COMMIT; SELECT 'T1_COMMIT_OK';\n" >&3
+          await_marker T1_COMMIT_OK /tmp/t1.log
+          printf "COMMIT; SELECT 'T2_COMMIT_OK';\n" >&4
+          await_marker T2_COMMIT_OK /tmp/t2.log
+
+          exec 3>&-
+          exec 4>&-
+          wait "$p1"
+          wait "$p2"
+
+          FINAL_COUNT=$(psql -X -v ON_ERROR_STOP=1 -qAt -c 'SELECT count(*) FROM public.probe_assignment WHERE request_no=101')
+          echo "FINAL_COUNT=$FINAL_COUNT"
+          psql -X -v ON_ERROR_STOP=1 -qAt -c 'SELECT request_no, person FROM public.probe_assignment ORDER BY person'
+          test "$FINAL_COUNT" = 3 || { echo 'FAIL: expected 3'; exit 1; }
+          echo "ANOMALY_CONFIRMED=YES"
