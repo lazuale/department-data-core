@@ -1,0 +1,283 @@
+name: DDC corrected evidence PostgreSQL 18
+on:
+  pull_request:
+    types: [synchronize]
+permissions:
+  contents: read
+jobs:
+  independent-diagnostic-probe:
+    if: github.head_ref == 'audit/canon-evidence-postgresql-20261012'
+    runs-on: ubuntu-latest
+    container:
+      image: postgres:18
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: probe_only
+          POSTGRES_DB: ddc_qual_isolated
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ddc_qual_isolated"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGDATABASE: ddc_qual_isolated
+      PGPASSWORD: probe_only
+    steps:
+      - name: Test published SQL and duplicate falsifier
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/section8_1.sql <<'SQL'
+          WITH input(org_code, request_no, work_no, minutes) AS (
+              VALUES
+                  ('СЕВ', 101, 1, 30),
+                  ('СЕВ', 101, 2, NULL::integer),
+                  ('ЮГ',  101, 1, 0),
+                  ('СЕВ', 102, 1, 50)
+          )
+          SELECT
+              COUNT(*) AS input_rows,
+              COUNT(DISTINCT (org_code, request_no)) AS requests,
+              COUNT(DISTINCT (org_code, request_no, work_no)) AS works,
+              COUNT(minutes) AS reported_minutes,
+              COUNT(*) FILTER (WHERE minutes = 0) AS zero_minutes,
+              COUNT(*) FILTER (WHERE minutes IS NULL) AS unknown_minutes
+          FROM input;
+          SQL
+          
+          cat > /tmp/section8_2.sql <<'SQL'
+          WITH input(org_code, request_no, work_no) AS (
+              VALUES
+                  ('СЕВ', 101, 1),
+                  ('СЕВ', 101, 2),
+                  ('ЮГ',  101, 1),
+                  ('СЕВ', 102, 1)
+          )
+          SELECT
+              COUNT(*) FILTER (
+                  WHERE org_code IS NULL
+                     OR request_no IS NULL
+                     OR work_no IS NULL
+              ) AS rows_with_null_key,
+              COUNT(*) - COUNT(DISTINCT (org_code, request_no, work_no))
+                  AS repeated_full_tuples
+          FROM input;
+          SQL
+          
+          cat > /tmp/section8_3.sql <<'SQL'
+          WITH input(org_code, request_no, work_no) AS (
+              VALUES
+                  ('СЕВ', 101, 1),
+                  ('СЕВ', 101, 2),
+                  ('ЮГ',  101, 1),
+                  ('СЕВ', 102, 1)
+          ),
+          witnesses AS (
+              SELECT
+                  'без организации' AS removed,
+                  request_no::text || '/' || work_no::text AS reduced_key,
+                  COUNT(DISTINCT org_code) AS distinct_full_keys
+              FROM input
+              GROUP BY request_no, work_no
+              HAVING COUNT(DISTINCT org_code) > 1
+          
+              UNION ALL
+          
+              SELECT
+                  'без номера заявки',
+                  org_code || '/' || work_no::text,
+                  COUNT(DISTINCT request_no)
+              FROM input
+              GROUP BY org_code, work_no
+              HAVING COUNT(DISTINCT request_no) > 1
+          
+              UNION ALL
+          
+              SELECT
+                  'без номера работы',
+                  org_code || '/' || request_no::text,
+                  COUNT(DISTINCT work_no)
+              FROM input
+              GROUP BY org_code, request_no
+              HAVING COUNT(DISTINCT work_no) > 1
+          )
+          SELECT removed, reduced_key, distinct_full_keys
+          FROM witnesses
+          ORDER BY removed, reduced_key;
+          SQL
+          
+          cat > /tmp/section8_4.sql <<'SQL'
+          WITH input(org_code, request_no, request_date) AS (
+              VALUES
+                  ('СЕВ', 101, DATE '2026-01-05'),
+                  ('СЕВ', 101, DATE '2026-01-05'),
+                  ('ЮГ',  101, DATE '2026-01-06'),
+                  ('СЕВ', 102, DATE '2026-01-07')
+          )
+          SELECT org_code, request_no
+          FROM input
+          GROUP BY org_code, request_no
+          HAVING COUNT(DISTINCT request_date) > 1
+              OR COUNT(*) FILTER (WHERE request_date IS NULL) > 0;
+          SQL
+          
+          cat > /tmp/section9.sql <<'SQL'
+          WITH original(request_no, work_kind, performer) AS (
+              VALUES
+                  (101, 'Осмотр', 'Иван'),
+                  (101, 'Ремонт', 'Пётр')
+          ),
+          works AS (
+              SELECT DISTINCT request_no, work_kind
+              FROM original
+          ),
+          performers AS (
+              SELECT DISTINCT request_no, performer
+              FROM original
+          ),
+          reconstructed AS (
+              SELECT w.request_no, w.work_kind, p.performer
+              FROM works AS w
+              JOIN performers AS p USING (request_no)
+          )
+          SELECT request_no, work_kind, performer
+          FROM reconstructed
+          EXCEPT
+          SELECT request_no, work_kind, performer
+          FROM original;
+          SQL
+          
+          cat > /tmp/duplicate_precheck.sql <<'SQL'
+          WITH input(org_code, request_no, work_no) AS (
+              VALUES
+                  ('СЕВ', 101, 1),
+                  ('СЕВ', 101, 1)
+          )
+          SELECT
+              COUNT(*) FILTER (
+                  WHERE org_code IS NULL
+                     OR request_no IS NULL
+                     OR work_no IS NULL
+              ) AS rows_with_null_key,
+              COUNT(*) - COUNT(DISTINCT (org_code, request_no, work_no))
+                  AS repeated_full_tuples
+          FROM input;
+          SQL
+          
+          cat > /tmp/duplicate_witness.sql <<'SQL'
+          WITH input(org_code, request_no, work_no) AS (
+              VALUES
+                  ('СЕВ', 101, 1),
+                  ('СЕВ', 101, 1)
+          ),
+          witnesses AS (
+              SELECT
+                  'без организации' AS removed,
+                  request_no::text || '/' || work_no::text AS reduced_key,
+                  COUNT(DISTINCT org_code) AS distinct_full_keys
+              FROM input
+              GROUP BY request_no, work_no
+              HAVING COUNT(DISTINCT org_code) > 1
+          
+              UNION ALL
+          
+              SELECT
+                  'без номера заявки',
+                  org_code || '/' || work_no::text,
+                  COUNT(DISTINCT request_no)
+              FROM input
+              GROUP BY org_code, work_no
+              HAVING COUNT(DISTINCT request_no) > 1
+          
+              UNION ALL
+          
+              SELECT
+                  'без номера работы',
+                  org_code || '/' || request_no::text,
+                  COUNT(DISTINCT work_no)
+              FROM input
+              GROUP BY org_code, request_no
+              HAVING COUNT(DISTINCT work_no) > 1
+          )
+          SELECT removed, reduced_key, distinct_full_keys
+          FROM witnesses
+          ORDER BY removed, reduced_key;
+          SQL
+          
+          cat > /tmp/null_precheck.sql <<'SQL'
+          WITH input(org_code, request_no, work_no) AS (
+              VALUES
+                  ('СЕВ', 101, NULL),
+                  ('СЕВ', 101, 2),
+                  ('ЮГ',  101, 1),
+                  ('СЕВ', 102, 1)
+          )
+          SELECT
+              COUNT(*) FILTER (
+                  WHERE org_code IS NULL
+                     OR request_no IS NULL
+                     OR work_no IS NULL
+              ) AS rows_with_null_key,
+              COUNT(*) - COUNT(DISTINCT (org_code, request_no, work_no))
+                  AS repeated_full_tuples
+          FROM input;
+          SQL
+          
+          psql -X -v ON_ERROR_STOP=1 -qAt <<'SQL'
+          CREATE TABLE public.review_department(department_code text PRIMARY KEY);
+          CREATE TABLE public.review_device(
+            device_code text PRIMARY KEY,
+            current_department_code text NOT NULL REFERENCES public.review_department,
+            assigned_on date NOT NULL
+          );
+          INSERT INTO public.review_department VALUES ('D1'), ('D2');
+          INSERT INTO public.review_device VALUES ('V1', 'D1', DATE '2026-01-01');
+          UPDATE public.review_device
+            SET current_department_code='D2', assigned_on=DATE '2026-02-01'
+            WHERE device_code='V1';
+          SQL
+          
+          check_exact() {
+            local label="$1" output="$2" expected="$3"
+            echo "RAW_$label=$output"
+            if [ "$output" != "$expected" ]; then
+              echo "FAIL $label: expected '$expected'"
+              exit 1
+            fi
+            echo "PASS_$label=YES"
+          }
+          V=$(psql -X -qAt -v ON_ERROR_STOP=1 -c 'SHOW server_version_num;')
+          check_exact "PG_VERSION" "$V" "180006"
+          P=$(psql -X -qAt -v ON_ERROR_STOP=1 < /tmp/section8_1.sql)
+          check_exact "COUNTS" "$P" "4|3|4|3|1|1"
+          P=$(psql -X -qAt -v ON_ERROR_STOP=1 < /tmp/section8_2.sql)
+          check_exact "KEY_PRECHECK" "$P" "0|0"
+          P=$(psql -X -qAt -v ON_ERROR_STOP=1 < /tmp/section8_3.sql)
+          printf 'RAW_WITNESSES_START\n%s\nRAW_WITNESSES_END\n' "$P"
+          test "$(printf '%s\n' "$P" | wc -l | tr -d ' ')" = 3
+          printf '%s\n' "$P" | grep -Fxq 'без организации|101/1|2'
+          printf '%s\n' "$P" | grep -Fxq 'без номера заявки|СЕВ/1|2'
+          printf '%s\n' "$P" | grep -Fxq 'без номера работы|СЕВ/101|2'
+          echo "PASS_THREE_DISTINCT_WITNESSES=YES"
+          P=$(psql -X -qAt -v ON_ERROR_STOP=1 < /tmp/section8_4.sql)
+          check_exact "FD_VIOLATIONS" "$P" ""
+          P=$(psql -X -qAt -v ON_ERROR_STOP=1 < /tmp/duplicate_precheck.sql)
+          check_exact "DUPLICATE_PRECHECK" "$P" "0|1"
+          P=$(psql -X -qAt -v ON_ERROR_STOP=1 < /tmp/duplicate_witness.sql)
+          check_exact "DUPLICATE_WITNESSES" "$P" ""
+          P=$(psql -X -qAt -v ON_ERROR_STOP=1 < /tmp/null_precheck.sql)
+          case "$P" in 1\|*) echo "RAW_NULL_PRECHECK=$P"; echo "PASS_NULL_GUARD=YES";; *) echo "FAIL_NULL_GUARD=$P"; exit 1;; esac
+          P=$(psql -X -qAt -v ON_ERROR_STOP=1 < /tmp/section9.sql)
+          printf 'RAW_SPURIOUS_START\n%s\nRAW_SPURIOUS_END\n' "$P"
+          test "$(printf '%s\n' "$P" | wc -l | tr -d ' ')" = 2
+          printf '%s\n' "$P" | grep -Fxq '101|Осмотр|Пётр'
+          printf '%s\n' "$P" | grep -Fxq '101|Ремонт|Иван'
+          echo "PASS_SPURIOUS_JOIN=YES"
+          P=$(psql -X -qAt -v ON_ERROR_STOP=1 -c "SELECT device_code || '|' || current_department_code || '|' || assigned_on FROM public.review_device")
+          check_exact "CURRENT_LINK_FK" "$P" "V1|D2|2026-02-01"
+          echo 'VALIDATION=PASS'
+          
