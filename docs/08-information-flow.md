@@ -164,3 +164,58 @@ flowchart TB
 - [Интеграция источников и девять границ](06-source-integration.md)
 - [Карта источников](07-source-catalog.md)
 - [План развития](04-roadmap.md)
+
+## 8. Первая безопасная инвентаризация PostgreSQL
+
+Запрос не меняет данные и показывает **фактическое наличие схем и объектов** в той базе, к которой подключился оператор. Наличие объекта само по себе не доказывает готовность рабочего процесса.
+
+```sql
+WITH wanted(schema_name) AS (
+    VALUES ('meta'), ('raw'), ('stg'), ('xref'), ('core'),
+           ('ops'), ('etl'), ('api'), ('mart')
+),
+relations AS (
+    SELECT n.nspname,
+           count(*) FILTER (WHERE c.relkind IN ('r', 'p')) AS tables,
+           count(*) FILTER (WHERE c.relkind = 'v') AS views,
+           count(*) FILTER (WHERE c.relkind = 'm') AS materialized_views
+    FROM pg_catalog.pg_namespace AS n
+    LEFT JOIN pg_catalog.pg_class AS c ON c.relnamespace = n.oid
+    GROUP BY n.nspname
+),
+routines AS (
+    SELECT n.nspname, count(*) AS functions_and_procedures
+    FROM pg_catalog.pg_proc AS p
+    JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+    GROUP BY n.nspname
+)
+SELECT w.schema_name,
+       CASE WHEN n.oid IS NULL THEN 'ABSENT' ELSE 'PRESENT' END AS schema_status,
+       coalesce(r.tables, 0) AS tables,
+       coalesce(r.views, 0) AS views,
+       coalesce(r.materialized_views, 0) AS materialized_views,
+       coalesce(f.functions_and_procedures, 0) AS routines
+FROM wanted AS w
+LEFT JOIN pg_catalog.pg_namespace AS n ON n.nspname = w.schema_name
+LEFT JOIN relations AS r ON r.nspname = w.schema_name
+LEFT JOIN routines AS f ON f.nspname = w.schema_name
+ORDER BY w.schema_name;
+```
+
+Контрольное наличие основных объектов путевых:
+
+```sql
+SELECT current_database() AS db,
+       current_setting('server_version') AS pg_version,
+       to_regclass('meta.waybill_scope') AS month_scope,
+       to_regclass('raw.waybill_record') AS raw_records,
+       to_regclass('stg.waybill_record') AS typed_records,
+       to_regclass('core.waybill') AS subject_waybill,
+       to_regclass('mart.waybill') AS analytical_waybill,
+       to_regclass('ops.waybill_check') AS paper_check,
+       to_regclass('api.waybill_check_pool') AS check_pool,
+       to_regprocedure('etl.prepare_waybill()') AS prepare_function,
+       to_regprocedure('etl.load_waybill()') AS publication_function;
+```
+
+Если в `ops` или `api` появится объект, следующий этап — проверить его DDL, права и фактический пользовательский сценарий. Нельзя считать ветку `010` применённой только по наличию файла в архиве. Для проверки текущих расчётов потребуются отдельные выборки по данным, без каких-либо изменений.
