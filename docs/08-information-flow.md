@@ -219,3 +219,86 @@ SELECT current_database() AS db,
 ```
 
 Если в `ops` или `api` появится объект, следующий этап — проверить его DDL, права и фактический пользовательский сценарий. Нельзя считать ветку `010` применённой только по наличию файла в архиве. Для проверки текущих расчётов потребуются отдельные выборки по данным, без каких-либо изменений.
+
+## 9. Результат инвентаризации 19.10.2026 — сообщение оператора
+
+**Источник свидетельства:** два вывода read-only запросов из §8, выполненных оператором в базе `ddc`. Проверка подтверждает только состав схем, количество объектов указанных типов и разрешение названных объектов в каталогах PostgreSQL на момент исполнения. Независимое повторение запроса автором документа не выполнялось.
+
+### RAW RESULT
+
+```text
+api    ABSENT   0 0 0 0
+core   PRESENT  5 0 0 0
+etl    PRESENT  0 0 0 2
+mart   PRESENT  0 5 0 0
+meta   PRESENT  1 0 0 0
+ops    ABSENT   0 0 0 0
+raw    PRESENT  1 0 0 0
+stg    PRESENT  0 1 0 0
+xref   ABSENT   0 0 0 0
+
+db=ddc
+server_version=18.6 (Ubuntu 18.6-1.pgdg26.04+2)
+month_scope=meta.waybill_scope
+raw_records=raw.waybill_record
+typed_records=stg.waybill_record
+subject_waybill=core.waybill
+analytical_waybill=mart.waybill
+paper_check=NULL
+check_pool=NULL
+prepare_function=etl.prepare_waybill()
+publication_function=etl.load_waybill()
+```
+
+Колонки первой матрицы: имя схемы, наличие, число таблиц, обычных представлений, материализованных представлений и функций/процедур. `NULL` во второй матрице означает отсутствие разрешённого имени объекта.
+
+### Вердикты с границами
+
+| Утверждение | Свидетельство | Статус |
+| --- | --- | --- |
+| В текущей базе существуют `meta`, `raw`, `stg`, `core`, `etl`, `mart` | Показания `pg_catalog` в выполненной оператором инвентаризации | MEASURED, по предоставленному выводу |
+| Схемы `xref`, `ops`, `api` в обследованной базе отсутствуют | Те же показания | MEASURED, по предоставленному выводу |
+| Известные таблицы/представления путевых и две функции `etl` существуют | `to_regclass`, `to_regprocedure` вернули имена | MEASURED, по предоставленному выводу |
+| Данные путевых полны, значения корректны, механизмы публикации безопасны | Инвентаризация это не проверяла | NOT VERIFIED |
+| Кандидатная миграция `010` внедрена | `ops` и `api` отсутствуют | Опровергнуто в пределах обследованной базы |
+| Другие источники уже интегрированы | Ни каталог, ни данные этих источников не проверялись | NOT VERIFIED |
+
+**Решение:** не создавать сейчас недостающие три схемы только ради заполнения архитектуры. Сначала завершить предметную проверку потока путевых и контракты новых источников. Кандидатную `010` не относить к установленной production-структуре.
+
+### Следующая проверка: наполненность потока
+
+Следующий запрос только читает данные и показывает объём текущих отношений, число сохранённых технических поступлений и соответствие зернистости основного `mart` и `core`. Наличие равных чисел — **не доказательство правильности значений**.
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+
+SELECT 'raw.waybill_record' AS relation_name, count(*) AS rows_count
+FROM raw.waybill_record
+UNION ALL SELECT 'core.waybill', count(*) FROM core.waybill
+UNION ALL SELECT 'core.waybill_driver', count(*) FROM core.waybill_driver
+UNION ALL SELECT 'core.waybill_task', count(*) FROM core.waybill_task
+UNION ALL SELECT 'core.waybill_idle', count(*) FROM core.waybill_idle
+UNION ALL SELECT 'core.waybill_fuel', count(*) FROM core.waybill_fuel
+UNION ALL SELECT 'mart.waybill', count(*) FROM mart.waybill
+ORDER BY relation_name;
+
+SELECT count(DISTINCT load_id) AS retained_raw_load_tokens
+FROM raw.waybill_record;
+
+SELECT
+    (SELECT count(*) FROM core.waybill) AS core_count,
+    (SELECT count(*) FROM mart.waybill) AS mart_count,
+    (
+        SELECT count(*)
+        FROM (
+            SELECT numbering_year, waybill_number
+            FROM mart.waybill
+            GROUP BY numbering_year, waybill_number
+            HAVING count(*) > 1
+        ) AS duplicate_keys
+    ) AS duplicate_mart_keys;
+
+COMMIT;
+```
+
+Это диагностический SQL, не миграция и не изменение структуры. Проверка может выполнить полное чтение нескольких больших таблиц, поэтому запускать в допустимое окно нагрузки.
