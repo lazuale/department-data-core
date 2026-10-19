@@ -302,3 +302,73 @@ COMMIT;
 ```
 
 Это диагностический SQL, не миграция и не изменение структуры. Проверка может выполнить полное чтение нескольких больших таблиц, поэтому запускать в допустимое окно нагрузки.
+
+## 10. Наполненность контура путевых — наблюдение оператора
+
+**Источник:** предоставленные оператором результаты read-only запросов, база `ddc`. Дата фиксации: 19.10.2026; точное время исполнения SQL не сообщалось. Независимый запуск в production автором документа не выполнялся.
+
+### RAW RESULT
+
+| Отношение | Количество строк |
+| --- | ---: |
+| `raw.waybill_record` | 1 186 296 |
+| `core.waybill` | 792 850 |
+| `core.waybill_driver` | 807 445 |
+| `core.waybill_task` | 799 684 |
+| `core.waybill_idle` | 748 664 |
+| `core.waybill_fuel` | 824 290 |
+| `mart.waybill` | 792 850 |
+
+По отдельному запросу `mart_rows = 792850` и `distinct_waybills = 792850`, где уникальность считалась для составной пары `(numbering_year, waybill_number)`.
+
+Значение `retained_load_tokens` в присланном сообщении не выделено однозначно, поэтому **NOT VERIFIED**. Нельзя приписывать ему значение на основании старых проверок.
+
+### CLAIM / EVIDENCE / LIMITATIONS / DECISION
+
+- **CLAIM:** основное `mart.waybill` не дублирует пары `(numbering_year, waybill_number)` в обследованном состоянии.
+- **EVIDENCE:** совпадение `mart_rows` и `distinct_waybills` на 792 850 строках.
+- **FALSIFIER:** наличие двух или более строк с одной парой ключевых значений либо несовпадение составов ключей CORE и MART.
+- **TEST:** агрегат `count(*)`, `count(DISTINCT (numbering_year, waybill_number))`; сравнение полных множеств ключей ещё не выполнялось.
+- **RAW RESULT:** 792 850 / 792 850.
+- **STATUS:** MEASURED на представленном состоянии.
+- **LIMITATIONS:** не подтверждены совпадение множеств ключей, правильность значений, сумма ГСМ, семантика длительности, границы снимков или результат рабочего процесса.
+- **DECISION:** принять отсутствие размножения по ключу для обследованной выборки; остальные инварианты оставить NOT VERIFIED.
+
+### Следующая проверка: от технических строк к предметным ключам
+
+Если в RAW действительно удерживаются только текущие принятые месячные снимки, ожидается совпадение множеств ключей из типизированных строк STG и CORE. Это ожидание **условно**: оно может быть неверно при иной политике удержания RAW, исключённых записях или преобразованиях бизнес-ключей. Расхождение сначала расследуется, а не исправляется через `DISTINCT`/замену ключей.
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+
+SELECT load_id, count(*) AS source_rows,
+       count(DISTINCT date_trunc('month', waybill_at)::date) AS business_months,
+       min(waybill_at)::date AS first_document_date,
+       max(waybill_at)::date AS last_document_date
+FROM stg.waybill_record
+GROUP BY load_id
+ORDER BY load_id;
+
+WITH source_keys AS MATERIALIZED (
+    SELECT DISTINCT extract(year FROM waybill_at)::integer AS numbering_year,
+                    waybill_number
+    FROM stg.waybill_record
+    WHERE waybill_at IS NOT NULL AND waybill_number IS NOT NULL
+)
+SELECT
+    (SELECT count(*) FROM (
+        SELECT numbering_year, waybill_number FROM source_keys
+        EXCEPT
+        SELECT numbering_year, waybill_number FROM core.waybill
+    ) AS missing) AS source_only_keys,
+    (SELECT count(*) FROM (
+        SELECT numbering_year, waybill_number FROM core.waybill
+        EXCEPT
+        SELECT numbering_year, waybill_number FROM source_keys
+    ) AS missing) AS core_only_keys;
+
+COMMIT;
+```
+
+Для крупной базы это полные проходы по источнику и может быть ресурсоёмко; выполнять в согласованное время. `MATERIALIZED` здесь фиксирует одно вычисление диагностического набора в рамках запроса и **не является** предложением создать production materialized view.
+
