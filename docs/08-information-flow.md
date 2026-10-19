@@ -372,3 +372,74 @@ COMMIT;
 
 Для крупной базы это полные проходы по источнику и может быть ресурсоёмко; выполнять в согласованное время. `MATERIALIZED` здесь фиксирует одно вычисление диагностического набора в рамках запроса и **не является** предложением создать production materialized view.
 
+## 11. STG ↔ CORE: равенство множества ключей
+
+**Полученный результат 19.10.2026:** оператор выполнил диагностическое сравнение множеств ключей из §10.
+
+```text
+source_only_keys | core_only_keys
+-----------------+---------------
+               0 |              0
+```
+
+**CLAIM:** множества `(extract(year from waybill_at)::integer, waybill_number)` в сохранённой типизированной STG и `(numbering_year, waybill_number)` в CORE совпадают.
+
+**EVIDENCE:** обе разности множеств `EXCEPT` равны нулю.
+
+**FALSIFIER:** хотя бы один ключ встречается только по одну сторону сравнения.
+
+**TEST:** read-only SQL из §10, `EXCEPT` в обе стороны по двум ключевым атрибутам.
+
+**RAW RESULT:** `source_only_keys=0`, `core_only_keys=0`.
+
+**STATUS:** MEASURED на обследованном состоянии, по предоставленному выводу; повторный независимый запуск не выполнялся.
+
+**LIMITATIONS:** из STG исключались записи с `waybill_at IS NULL` или `waybill_number IS NULL`; их количество здесь не измерено. `DISTINCT` сравнивает множество пар, а не число физических строк. Не проверялись предметная устойчивость ключа, равенство атрибутов, детальные записи водителей/работ/простоев/ГСМ, семантика обновления и полнота месячных поставок. Результат первого запроса по `load_id` из §10 оператор не передал.
+
+**DECISION:** для существующих ненулевых пар не обнаружено потерянных или лишних ключей в CORE. До изучения полноты исходных строк и сравнения значений остальные выводы остаются NOT VERIFIED.
+
+### Следующий тест — фактическое содержание заголовка ПЛ
+
+Проверить `NULL`-ключи и полный набор предметных атрибутов заголовка из STG и CORE. Сравнение выполняется по совпадающему контракту полей миграций 002/004/006; в отношении гаражного номера имена различаются (`vehicle_garage_number` в STG и `garage_number` в CORE).
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY;
+
+SELECT
+  count(*) AS stg_rows,
+  count(*) FILTER (WHERE waybill_at IS NULL OR waybill_number IS NULL)
+    AS rows_with_incomplete_key
+FROM stg.waybill_record;
+
+WITH source_headers AS MATERIALIZED (
+  SELECT DISTINCT
+    extract(year FROM waybill_at)::integer AS numbering_year,
+    waybill_number, waybill_at, is_calculated, departure_at, return_at,
+    organization_name, department_name, waybill_type, vehicle_work_mode,
+    departure_meter, return_meter, note, responsible_name,
+    vehicle_type, vehicle_make, vehicle_model, vehicle_vin,
+    vehicle_garage_number AS garage_number, vehicle_plate
+  FROM stg.waybill_record
+  WHERE waybill_at IS NOT NULL AND waybill_number IS NOT NULL
+), core_headers AS MATERIALIZED (
+  SELECT numbering_year, waybill_number, waybill_at, is_calculated,
+    departure_at, return_at, organization_name, department_name,
+    waybill_type, vehicle_work_mode, departure_meter, return_meter,
+    note, responsible_name, vehicle_type, vehicle_make, vehicle_model,
+    vehicle_vin, garage_number, vehicle_plate
+  FROM core.waybill
+)
+SELECT
+  (SELECT count(*) FROM (
+    SELECT * FROM source_headers
+    EXCEPT SELECT * FROM core_headers
+  ) AS d) AS stg_only_header_variants,
+  (SELECT count(*) FROM (
+    SELECT * FROM core_headers
+    EXCEPT SELECT * FROM source_headers
+  ) AS d) AS core_only_header_variants;
+
+COMMIT;
+```
+
+Ожидаемые нули — лишь проверяемая гипотеза. Даже при нулях полностью совпавшие заголовки не докажут правильность числовой семантики или остальных дочерних фактов. Запросы читают крупные наборы данных.
